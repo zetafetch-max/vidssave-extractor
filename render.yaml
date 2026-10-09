@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: vidssave-extractor
+    env: node
+    rootDir: backend
+    buildCommand: npm install && npx playwright install chromium
+    startCommand: node server.js
+    envVars:
+      - key: NODE_VERSION
+        value: 18
