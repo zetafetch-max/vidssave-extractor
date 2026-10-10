@@ -328,12 +328,28 @@ app.get('/api/probe-innertube', async (req, res) => {
 
 app.get('/api/probe-ytdlp', async (req, res) => {
   const url = req.query.url || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+  const full = req.query.full === '1';
+  const check = req.query.check === '1';
   const t0 = Date.now();
   try {
     const cmd = YTDLP + ' --no-playlist --skip-download -g -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" ' + JSON.stringify(url);
     const out = execSync(cmd, { timeout: 70000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
     const urls = out.trim().split(/\r?\n/).filter(Boolean);
-    res.json({ ok: urls.length > 0, count: urls.length, ms: Date.now() - t0, urls: urls.slice(0, 4).map((u) => u.slice(0, 110)) });
+    const resp = { ok: urls.length > 0, count: urls.length, ms: Date.now() - t0 };
+    if (full) resp.urls = urls.slice(0, 4);
+    else resp.urls = urls.slice(0, 4).map((u) => u.slice(0, 110));
+    if (check && urls[0]) {
+      try {
+        const c = new AbortController();
+        const tt = setTimeout(() => c.abort(), 15000);
+        const hr = await fetch(urls[0], { method: 'HEAD', signal: c.signal, redirect: 'follow' });
+        clearTimeout(tt);
+        resp.head = { status: hr.status, len: hr.headers.get('content-length') || '', type: hr.headers.get('content-type') || '' };
+      } catch (e) {
+        resp.head = { error: String((e && e.message) || e) };
+      }
+    }
+    res.json(resp);
   } catch (e) {
     res.status(500).json({ ok: false, ms: Date.now() - t0, error: String((e && e.stderr && e.stderr.toString()) || (e && e.message) || e).slice(0, 500) });
   }
