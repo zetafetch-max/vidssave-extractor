@@ -194,14 +194,35 @@ async function captureRow(context, page, rowText, waitMs, qualityNum) {
 
 async function extractFromPage(context, page, videoUrl) {
   const t0 = Date.now();
-  await page.goto(SITE, { waitUntil: 'domcontentloaded', timeout: 90000 });
+  let gotoErr = null;
+  try { await page.goto(SITE, { waitUntil: 'domcontentloaded', timeout: 60000 }); } catch (e) { gotoErr = e; }
   await page.waitForTimeout(3500);
 
+  const diag = await page.evaluate(() => {
+    const b = document.body ? document.body.innerText : '';
+    return {
+      title: document.title || '',
+      url: location.href,
+      hasInput: !!document.querySelector('input#url-input-wrapper'),
+      body: b.replace(/\s+/g, ' ').slice(0, 300)
+    };
+  }).catch(() => ({}));
+  console.log('[extractor] goto=' + (gotoErr ? 'err:' + gotoErr.message.slice(0, 80) : 'ok') + ' title=' + JSON.stringify(diag.title) + ' hasInput=' + diag.hasInput + ' body=' + JSON.stringify((diag.body || '').slice(0, 140)));
+
   const input = page.locator('input#url-input-wrapper').first();
-  await input.click();
+  try {
+    await input.waitFor({ state: 'visible', timeout: 20000 });
+    await input.click({ timeout: 10000 });
+  } catch (e) {
+    throw new Error('vidssave did not render its form for this server IP (input#url-input-wrapper missing). title="' + (diag.title || '') + '" body="' + (diag.body || '').slice(0, 160) + '"');
+  }
   await input.type(videoUrl, { delay: 8 });
   await page.waitForTimeout(700);
-  await page.getByRole('button', { name: 'Download' }).first().click();
+  try {
+    await page.getByRole('button', { name: 'Download' }).first().click({ timeout: 10000 });
+  } catch (e) {
+    throw new Error('vidssave Download button did not appear. title="' + (diag.title || '') + '"');
+  }
 
   const rows = await waitForRows(page, 4, 75000);
   const videoRows = rows.filter((r) => !r.isAudio);
