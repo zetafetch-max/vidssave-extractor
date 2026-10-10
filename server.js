@@ -97,7 +97,11 @@ async function fetchOembed(url) {
   }
 }
 
-const CLIENTS = ['android', 'web_embedded', 'android_vr', 'ios'];
+/* Order matters: the ANDROID-family clients are the most PO/bot-wall resistant
+   (verified: they crack viral Shorts from residential IPs while WEB/ios cannot).
+   Others fill in when one client is temporarily quota-limited. */
+const CLIENTS = ['android', 'android_vr', 'ios', 'web_embedded', 'tv_embedded'];
+const WALL_COOLDOWN_MS = 8000;
 const extractCache = new Map();
 const EXTRACT_CACHE_TTL = 4 * 60 * 1000;
 
@@ -106,43 +110,72 @@ function isBotWall(e) {
   return /Sign in to confirm/i.test(s);
 }
 
+function errTail(e) {
+  const s = String(((e && e.stderr) || '').toString() || (e && e.message) || e)
+    .replace(/\s+/g, ' ').trim();
+  return s ? (s.length > 160 ? s.slice(0, 160) + '…' : s) : '(no message)';
+}
+
+/* One full rotation pass over the client list, returning the first success. */
+async function tryClients(url, clients) {
+  for (const client of clients) {
+    const args = ['--no-playlist', '--no-warnings', '--no-color', '--js-runtimes', JS_RUNTIME, '-j', url];
+    if (client) args.unshift('--extractor-args', 'youtube:player_client=' + client);
+    try {
+      const r = await runYt(args, 60000);
+      const j = JSON.parse(r.stdout);
+      if (j && (j.formats || []).length) return { j };
+      console.log('[extractor] client=' + (client || 'default') + ' -> empty formats');
+      return { empty: true };
+    } catch (e) {
+      console.log('[extractor] client=' + (client || 'default') + ' -> ' + errTail(e));
+      if (isBotWall(e)) return { wall: true };
+      return { hard: e };
+    }
+  }
+  return { none: true };
+}
+
 /* Fetch the video's full metadata + format table with a single yt-dlp call.
-   YouTube rate-limits the default WEB client on datacenter IPs ("Sign in to
-   confirm you're not a bot"), so on failure every other client is tried before
-   giving up. Successful results are cached briefly to avoid re-hits. */
+   YouTube rate-limits datacenter IPs ("Sign in to confirm you're not a bot") —
+   for most videos its per-video PO proof, sometimes a short quota burst. We
+   rotate clients (ANDROID first), cache successes briefly, and on a pure wall
+   wait a few seconds then re-run the rotation once (quota walls often clear in
+   seconds; persisting PO proofs are not surmountable from a free host — the
+   caller gets an honest message). */
 async function loadVideoInfo(url) {
   const hit = extractCache.get(url);
   if (hit && Date.now() - hit.t < EXTRACT_CACHE_TTL) return hit.j;
 
-  const buildArgs = (client) => {
-    const base = ['--no-playlist', '--no-warnings', '--no-color', '--js-runtimes', JS_RUNTIME, '-j', url];
-    if (client) base.unshift('--extractor-args', 'youtube:player_client=' + client);
-    return base;
-  };
+  const clients = [null].concat(CLIENTS);
+  const passes = [[clients],
+    null]; // second pass only if the first ended with a wall
 
-  let wallSeen = false;
   let firstHard = null;
   let lastErr = null;
-  for (const client of [null].concat(CLIENTS)) {
-    try {
-      const r = await runYt(buildArgs(client), 90000);
-      const j = JSON.parse(r.stdout);
-      if (j && (j.formats || []).length) {
-        extractCache.set(url, { t: Date.now(), j });
-        if (extractCache.size > 60) {
-          for (const [k, v] of extractCache) if (Date.now() - v.t > EXTRACT_CACHE_TTL) extractCache.delete(k);
-        }
-        return j;
+  const seenWalls = [];
+  for (let pass = 0; pass < passes.length; pass++) {
+    const list = pass === 0 ? clients : passes[1];
+    const out = await tryClients(url, list);
+    if (out.j) {
+      extractCache.set(url, { t: Date.now(), j: out.j });
+      if (extractCache.size > 60) {
+        for (const [k, v] of extractCache) if (Date.now() - v.t > EXTRACT_CACHE_TTL) extractCache.delete(k);
       }
-      lastErr = new Error('No playable formats in response.');
-    } catch (e) {
-      lastErr = e;
-      if (isBotWall(e)) { wallSeen = true; continue; }
-      if (firstHard === null) firstHard = e;
+      return out.j;
+    }
+    if (out.wall) seenWalls.push((list[0] === null ? 'default' : 'list') + ' pass=' + pass);
+    if (out.hard && firstHard === null) firstHard = out.hard;
+    lastErr = out.empty ? new Error('No playable formats in response.') : (out.hard || out.wall || lastErr);
+    if (!out.wall && !out.none) break;
+    if (pass === 0) {
+      console.log('[extractor] wall detected, cooling down ' + WALL_COOLDOWN_MS + 'ms then retrying…');
+      await new Promise((r) => setTimeout(r, WALL_COOLDOWN_MS));
+      passes[1] = clients; // full re-rotation once
     }
   }
-  if (wallSeen) {
-    const e = new Error('YouTube is rate-limiting this server (bot check). We rotate clients automatically; try again in a minute.');
+  if (seenWalls.length) {
+    const e = new Error('YouTube is rate-limiting this server (bot check) — it can persist for viral Shorts. We rotated clients and retried automatically; come back in a minute and press Retry.');
     e.isWall = true;
     throw e;
   }
@@ -332,6 +365,7 @@ app.all('/api/file/*', async (req, res) => {
 app.get('/api/probe-ytdlp', async (req, res) => {
   const url = req.query.url || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
   const full = req.query.full === '1';
+  const client = (req.query.client || '').trim(); // optional: force a specific innerTube client
   const t0 = Date.now();
   try {
     const args = [
@@ -342,11 +376,12 @@ app.get('/api/probe-ytdlp', async (req, res) => {
       '-f', 'best[height<=720]/best',
       url
     ];
-    const r = await runYt(args, 70000);
+    if (client) args.splice(args.indexOf('--skip-download'), 0, '--extractor-args', 'youtube:player_client=' + client);
+    const r = await runYt(args, 90000);
     const urls = r.stdout.trim().split(/\r?\n/).filter(Boolean);
-    res.json({ ok: urls.length > 0, count: urls.length, ms: Date.now() - t0, urls: urls.slice(0, 4).map((u) => (full ? u : u.slice(0, 110))) });
+    res.json({ ok: urls.length > 0, count: urls.length, ms: Date.now() - t0, client: client || 'default', urls: urls.slice(0, 4).map((u) => (full ? u : u.slice(0, 110))) });
   } catch (e) {
-    res.status(500).json({ ok: false, ms: Date.now() - t0, error: String(((e && e.stderr) || '').toString() || (e && e.message) || e).slice(0, 500) });
+    res.status(500).json({ ok: false, ms: Date.now() - t0, client: client || 'default', error: String(((e && e.stderr) || '').toString() || (e && e.message) || e).slice(0, 500) });
   }
 });
 
