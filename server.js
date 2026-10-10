@@ -97,17 +97,56 @@ async function fetchOembed(url) {
   }
 }
 
-/* Fetch the video's full metadata + format table with a single yt-dlp call. */
+const CLIENTS = ['android', 'web_embedded', 'android_vr', 'ios'];
+const extractCache = new Map();
+const EXTRACT_CACHE_TTL = 4 * 60 * 1000;
+
+function isBotWall(e) {
+  const s = String(((e && e.stderr) || '') + ' ' + ((e && e.message) || ''));
+  return /Sign in to confirm/i.test(s);
+}
+
+/* Fetch the video's full metadata + format table with a single yt-dlp call.
+   YouTube rate-limits the default WEB client on datacenter IPs ("Sign in to
+   confirm you're not a bot"), so on failure every other client is tried before
+   giving up. Successful results are cached briefly to avoid re-hits. */
 async function loadVideoInfo(url) {
-  const args = [
-    '--no-playlist', '--no-warnings', '--no-color',
-    '--js-runtimes', JS_RUNTIME,
-    '-j',
-    url
-  ];
-  const r = await runYt(args, 90000);
-  const j = JSON.parse(r.stdout);
-  return j;
+  const hit = extractCache.get(url);
+  if (hit && Date.now() - hit.t < EXTRACT_CACHE_TTL) return hit.j;
+
+  const buildArgs = (client) => {
+    const base = ['--no-playlist', '--no-warnings', '--no-color', '--js-runtimes', JS_RUNTIME, '-j', url];
+    if (client) base.unshift('--extractor-args', 'youtube:player_client=' + client);
+    return base;
+  };
+
+  let wallSeen = false;
+  let firstHard = null;
+  let lastErr = null;
+  for (const client of [null].concat(CLIENTS)) {
+    try {
+      const r = await runYt(buildArgs(client), 90000);
+      const j = JSON.parse(r.stdout);
+      if (j && (j.formats || []).length) {
+        extractCache.set(url, { t: Date.now(), j });
+        if (extractCache.size > 60) {
+          for (const [k, v] of extractCache) if (Date.now() - v.t > EXTRACT_CACHE_TTL) extractCache.delete(k);
+        }
+        return j;
+      }
+      lastErr = new Error('No playable formats in response.');
+    } catch (e) {
+      lastErr = e;
+      if (isBotWall(e)) { wallSeen = true; continue; }
+      if (firstHard === null) firstHard = e;
+    }
+  }
+  if (wallSeen) {
+    const e = new Error('YouTube is rate-limiting this server (bot check). We rotate clients automatically; try again in a minute.');
+    e.isWall = true;
+    throw e;
+  }
+  throw firstHard || lastErr;
 }
 
 function isCombined(f) {
@@ -242,11 +281,14 @@ app.get('/api/extract', async (req, res) => {
       variants.push({ key: 'sd', ext: 'mp4', url: front + '/api/file/' + ytId + '_sd.mp4' });
     }
 
-    const meta = await fetchOembed(url);
+    let meta = { title: '', author: '' };
+    if (!info || !info.title) {
+      try { meta = await fetchOembed(url); } catch (_) {}
+    }
     res.json({
       platform: 'youtube',
-      title: (info && (info.title || '')) || meta.title || 'YouTube video',
-      author: (info && (info.channel || info.uploader || '')) || meta.author || '',
+      title: (info && info.title) || meta.title || 'YouTube video',
+      author: (info && (info.channel || info.uploader)) || meta.author || '',
       thumbnail: 'https://i.ytimg.com/vi/' + ytId + '/hqdefault.jpg',
       duration: (info && info.duration) || 0,
       variants
@@ -254,7 +296,7 @@ app.get('/api/extract', async (req, res) => {
   } catch (e) {
     console.log('[extractor] extract error: ' + ((e && e.message) || e));
     const detail = ((e && e.stderr) || '').toString();
-    const msg = friendlyError(detail) || friendlyError((e && e.message) || '');
+    const msg = e.isWall ? e.message : (friendlyError(detail) || friendlyError((e && e.message) || ''));
     res.status(422).json({ error: msg || 'Could not resolve this video. It may be unavailable or YouTube is throttling requests. Try again in a minute.' });
   }
 });
