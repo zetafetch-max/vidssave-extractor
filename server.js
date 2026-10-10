@@ -278,6 +278,35 @@ app.get('/', (req, res) => {
   res.json({ ok: true, msg: 'VidSave extractor backend' });
 });
 
+// Diagnostic: can this server reach the vidssave parse API directly?
+// (The website serves datacenter IPs an empty page; the API may not block.)
+app.get('/api/probe', (req, res) => {
+  const link = req.query.link || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+  const form = new URLSearchParams({
+    hostname: 'vidssave.com',
+    auth: '4c9b7d21',
+    domain: 'api-ak.vidssave.com',
+    origin: 'cache',
+    link
+  });
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 25000);
+  fetch('https://api.vidssave.com/api/contentsite_api/media/parse', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: form.toString(),
+    redirect: 'manual',
+    signal: ctrl.signal
+  }).then(async (r) => {
+    clearTimeout(t);
+    const txt = await r.text();
+    res.json({ status: r.status, ctype: r.headers.get('content-type') || '', url: r.url, len: txt.length, head: txt.slice(0, 300) });
+  }).catch((e) => {
+    clearTimeout(t);
+    res.status(500).json({ probeError: String((e && e.message) || e) });
+  });
+});
+
 app.get('/api/extract', (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'url required' });
