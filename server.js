@@ -1,87 +1,83 @@
 const express = require('express');
 const cors = require('cors');
-const { chromium } = require('playwright');
-const { execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const util = require('util');
+const { execFile } = require('child_process');
+
+const execFileP = util.promisify(execFile);
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
-const SITE = 'https://vidssave.com/youtube-video-downloader-8hs';
 const YTDLP = './yt-dlp';
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
-const LAUNCH_ARGS = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'];
+const JS_RUNTIME = 'node';
+const CACHE_DIR = process.env.CACHE_DIR || '/tmp/excache';
+const MAX_CACHE_BYTES = 350 * 1024 * 1024;
+const FILE_TTL_MS = 24 * 60 * 60 * 1000;
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+let FFMPEG_LOC = ''; // dir containing a usable ffmpeg binary, if one was found
 
-/* Make sure the yt-dlp binary is present (self-heal, like the browser). */
-async function ensureYtdlp() {
-  try {
-    execSync(YTDLP + ' --version', { stdio: 'ignore' });
-    return;
-  } catch (_) {}
-  try {
-    console.log('[extractor] downloading yt-dlp...');
-    execSync('curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ' + YTDLP, { stdio: 'inherit', timeout: 120000 });
-    execSync('chmod +x ' + YTDLP);
-    console.log('[extractor] yt-dlp ready');
-  } catch (e) {
-    console.log('[extractor] yt-dlp download failed: ' + (e && e.message || e));
-  }
-}
+fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 /* ---------------------------------------------------------------------------
-   Chromium self-heal
-   If the Playwright browser binary is missing (e.g. Render built with only
-   `npm install`), download it on boot. Cached after first time.
+   yt-dlp + ffmpeg self-heal
    ------------------------------------------------------------------------- */
-async function ensureChromium() {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const b = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
-      await b.close();
-      console.log('[extractor] Chromium ready');
-      return;
-    } catch (e) {
-      const msg = String(e.message || '');
-      if ((attempt === 0 || attempt === 1) && (/Executable doesn't exist|Looks like Playwright was just installed|chromium_headless_shell/i.test(msg))) {
-        console.log('[extractor] Chromium missing or mismatch \u2014 installing...');
-        try { execSync('npx playwright install chromium --with-deps', { stdio: 'inherit' }); } catch (_) { execSync('npx playwright install chromium', { stdio: 'inherit' }); }
-        await sleep(1500);
-        continue;
+function runYt(args, timeoutMs) {
+  return execFileP(YTDLP, args, {
+    timeout: timeoutMs || 120000,
+    maxBuffer: 64 * 1024 * 1024
+  });
+}
+
+/* Locate a usable ffmpeg: PATH first, then Playwright's bundled copy. */
+async function locateFfmpeg() {
+  try {
+    await execFileP('ffmpeg', ['-version'], { timeout: 5000 });
+    return '';
+  } catch (_) {}
+  const roots = [path.join(process.env.HOME || '/', '.cache', 'ms-playwright')];
+  if (fs.existsSync('/opt/render/.cache/ms-playwright')) roots.push('/opt/render/.cache/ms-playwright');
+  for (const root of roots) {
+    let sub = [];
+    try { sub = fs.readdirSync(root); } catch (_) { continue; }
+    for (const d of sub) {
+      if (!/^ffmpeg-/.test(d)) continue;
+      for (const b of [path.join(root, d, 'ffmpeg-linux'), path.join(root, d, 'ffmpeg')]) {
+        if (!fs.existsSync(b)) continue;
+        try { await execFileP(b, ['-version'], { timeout: 5000 }); return path.dirname(b); } catch (_) {}
       }
-      throw e;
     }
   }
+  return '';
+}
+
+async function ensureYtdlp() {
+  try {
+    const v = await execFileP(YTDLP, ['--version'], { timeout: 8000 });
+    console.log('[extractor] yt-dlp ready (' + v.stdout.trim() + ')');
+  } catch (_) {
+    console.log('[extractor] downloading yt-dlp...');
+    try {
+      const tmp = YTDLP + '.tmp';
+      const builtin = require('child_process');
+      builtin.execFileSync('curl', ['-fsSL', 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp', '-o', tmp], { stdio: 'inherit', timeout: 180000 });
+      builtin.execFileSync('chmod', ['+x', tmp], { stdio: 'ignore' });
+      fs.renameSync(tmp, YTDLP);
+      console.log('[extractor] yt-dlp ready');
+    } catch (e) {
+      console.log('[extractor] yt-dlp download failed: ' + ((e && e.message) || e));
+    }
+  }
+  FFMPEG_LOC = await locateFfmpeg();
+  console.log('[extractor] ffmpeg location: ' + (FFMPEG_LOC || 'PATH'));
 }
 
 /* ---------------------------------------------------------------------------
-   Persistent browser + request serialization.
-   vidssave renders one result list at a time on a single page, so we run one
-   extraction at a time and reuse a warm browser between requests.
+   Helpers
    ------------------------------------------------------------------------- */
-let browserInstance = null;
-async function getBrowser() {
-  if (browserInstance) {
-    try { if (browserInstance.isConnected()) return browserInstance; } catch (_) {}
-    browserInstance = null;
-  }
-  const b = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
-  b.on('disconnected', () => { if (browserInstance === b) browserInstance = null; });
-  browserInstance = b;
-  return b;
-}
-
-let chain = Promise.resolve();
-function withLock(fn) {
-  const result = chain.then(fn, fn);
-  chain = result.then(() => {}, () => {});
-  return result;
-}
-
 function youtubeVideoId(url) {
   const m = String(url || '').match(/(?:youtu\.be\/|v=|\/shorts\/|\/embed\/|\/live\/|watch\/(?:v\/)?)([A-Za-z0-9_-]{11})/);
   return m ? m[1] : null;
@@ -101,315 +97,234 @@ async function fetchOembed(url) {
   }
 }
 
-/* Collect the quality rows vidssave renders after parsing. Runs in-browser.
-   Rows are <li> cards whose text looks like "MP4 720P 28.4 MB Fast Download".
-   Nav items also say "Download" but never contain MP4/MP3, so they drop out. */
-function collectRows() {
-  const rows = [];
-  const lis = Array.from(document.querySelectorAll('li'));
-  for (const li of lis) {
-    const t = (li.textContent || '').replace(/\s+/g, ' ').trim();
-    if (!/Download/i.test(t) || !/MP4|MP3/i.test(t)) continue;
-    // textContent has no separators between spans, e.g. "MP4240P7.46 MBFastDownload".
-    // A lookbehind stops the greedy run from swallowing MP4/MP3's leading digit
-    // (which would turn "4720P" into 4720 and get misclassified as HD).
-    const qm = t.match(/(?<!MP)(\d+)\s*(P|KBPS)/i);
-    rows.push({
-      text: t,
-      isAudio: /MP3/i.test(t),
-      qualityNum: qm ? parseInt(qm[1], 10) || 0 : 0
-    });
+/* Fetch the video's full metadata + format table with a single yt-dlp call. */
+async function loadVideoInfo(url) {
+  const args = [
+    '--no-playlist', '--no-warnings', '--no-color',
+    '--js-runtimes', JS_RUNTIME,
+    '-j',
+    url
+  ];
+  const r = await runYt(args, 90000);
+  const j = JSON.parse(r.stdout);
+  return j;
+}
+
+function isCombined(f) {
+  return f && f.url && f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none';
+}
+
+/* Choose the best directly-downloadable combined MP4 for a max height, or null. */
+function bestCombined(formats, maxH, minH) {
+  const m = (formats || [])
+    .filter((f) => isCombined(f) && f.ext === 'mp4' && /^(avc1)/.test(f.vcodec) &&
+      f.height && f.height <= maxH && (!minH || f.height >= minH))
+    .sort((a, b) => (b.height || 0) - (a.height || 0));
+  return m[0] || null;
+}
+
+function friendlyError(stderr) {
+  const s = String(stderr || '');
+  if (/Sign in to confirm/.test(s)) return 'YouTube asked for a login to view this video. Try a different video.';
+  if (/Video unavailable/.test(s)) return 'This video is unavailable (deleted, private, or region-blocked).';
+  if (/[Pp]rivate video/.test(s)) return 'This is a private video.';
+  if (/is[-_ ]?live/i.test(s) && /live/i.test(s)) return 'Live streams are not supported yet.';
+  if (/Requested format is not available|Unable to extract|No video formats/.test(s)) return 'No downloadable stream found for this video.';
+  if (/This content is not available/.test(s)) return 'This video is not available.';
+  return '';
+}
+
+/* ---------------------------------------------------------------------------
+   In-flight mux dedupe
+   ------------------------------------------------------------------------- */
+let muxChain = Promise.resolve();
+function runMuxExclusive(fn) {
+  const r = muxChain.then(fn, fn);
+  muxChain = r.then(() => {}, () => {});
+  return r;
+}
+const muxInFlight = {};
+
+function cacheFileName(name) {
+  const m = String(name || '').match(/^([A-Za-z0-9_]{2,80})_(hd|sd)\.mp4$/);
+  return m ? m[1] + '_' + m[2] + '.mp4' : null;
+}
+
+async function ensureMuxed(videoId, key, maxH) {
+  const fname = videoId + '_' + key + '.mp4';
+  const full = path.join(CACHE_DIR, fname);
+  if (fs.existsSync(full)) return full;
+
+  const base = 'https://www.youtube.com/watch?v=' + videoId;
+  const args = [
+    '--no-playlist', '--no-warnings', '--no-color',
+    '--js-runtimes', JS_RUNTIME,
+    '-f', muxFormat(maxH),
+    '--merge-output-format', 'mp4',
+    '--no-overwrites',
+    '-o', path.join(CACHE_DIR, videoId + '_' + key + '.%(ext)s'),
+    base
+  ];
+  if (FFMPEG_LOC) args.unshift('--ffmpeg-location', FFMPEG_LOC);
+
+  await runYt(args, 600000);
+  if (!fs.existsSync(full)) {
+    // yt-dlp may have produced another container
+    const dir = fs.readdirSync(CACHE_DIR).filter((n) => n.startsWith(videoId + '_' + key + '.'));
+    if (!dir.length) throw new Error('merge produced no file');
+    const target = path.join(CACHE_DIR, fname);
+    fs.renameSync(path.join(CACHE_DIR, dir[0]), target);
   }
-  return rows;
+  touchCache();
+  return full;
 }
 
-/* Wait until the full quality list has rendered. Rows appear progressively
-   (240P/1440P land first, then the rest), so poll for a stable set. */
-async function waitForRows(page, minRows, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  let rows = [];
-  let stableFor = 0;
-  while (Date.now() < deadline) {
-    rows = await page.evaluate(collectRows).catch(() => []);
-    if (rows.length >= minRows) break;
-    await sleep(2000);
-  }
-  // let any late rows paint, then take a final sample
-  await sleep(1200);
-  const final = await page.evaluate(collectRows).catch(() => rows);
-  return final.length >= rows.length ? final : rows;
+function muxFormat(maxH) {
+  const v = 'bestvideo[ext=mp4][vcodec^=avc1][height<=' + maxH + ']+bestaudio[ext=m4a]';
+  const v2 = 'bestvideo[ext=mp4][height<=' + maxH + ']+bestaudio[ext=m4a]';
+  const v3 = 'bestvideo[ext=mp4][height<=' + maxH + ']+bestaudio';
+  const v4 = 'bestvideo[height<=' + maxH + ']+bestaudio/best';
+  return v + '/' + v2 + '/' + v3 + '/' + v4;
 }
 
-/* Resolve with the direct link produced when a row's Download control is
-   clicked. Primary signal: the `media/download_redirect` response's Location
-   header (302 -> down-de.vidssave.com/...). Backup: a real browser download
-   event. Bound to the context so popups/secondary pages are caught too. */
-async function captureLink(context, ms) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const cleanup = () => { clearTimeout(timer); context.off('response', onResponse); context.off('download', onDownload); };
-    const finish = (v) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve(v && v.url && /^https?:/i.test(v.url) ? { url: v.url, name: v.name || '' } : null);
-    };
-    const onResponse = (r) => {
-      if (settled) return;
-      const u = r.url();
-      if (u.indexOf('contentsite_api/media/download_redirect') === -1) return;
-      try {
-        const loc = (r.headers()['location'] || '') || '';
-        finish(loc ? { url: loc, name: '' } : null);
-      } catch (_) {}
-    };
-    const onDownload = (d) => {
-      if (settled) return;
-      let url = '';
-      try { url = d.url(); } catch (_) {}
-      let name = '';
-      try { name = d.suggestedFilename ? d.suggestedFilename() : ''; } catch (_) {}
-      try { d.cancel && d.cancel(); } catch (_) {}
-      if (/^blob:/i.test(url)) return;
-      finish(url ? { url, name } : null);
-    };
-    context.on('response', onResponse);
-    context.on('download', onDownload);
-    const timer = setTimeout(() => finish(null), ms);
-  });
-}
-
-async function closeExtraPages(context) {
-  const pages = context.pages();
-  for (let i = 1; i < pages.length; i++) {
-    try { await pages[i].close(); } catch (_) {}
-  }
-}
-
-/* Click one quality row's Download control and capture the direct CDN URL it
-   produces. Retries once. Returns null when the row gives no usable link. */
-async function captureRow(context, page, rowText, waitMs, qualityNum) {
-  const locator = page.locator('li', { hasText: rowText }).locator('div[aria-disabled="false"]').first();
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const wait = captureLink(context, waitMs);
-    let clickOk = false;
-    try { await locator.click({ timeout: 12000 }); clickOk = true; } catch (e) { clickOk = false; }
-    const r = await wait;
-    await closeExtraPages(context);
-    console.log('[extractor]  row="' + rowText.slice(0, 20) + '" attempt=' + attempt + ' click=' + (clickOk ? 'ok' : 'fail') + ' got=' + (r && r.url ? 'link' : 'none'));
-    if (r && r.url) {
-      // Reject a stray/duplicate redirect that doesn't belong to this row's
-      // quality (vidssave re-emits recent links with a delay).
-      const matches = qualityNum === 0 || new RegExp(qualityNum + '[pP]').test(r.url);
-      if (matches) return r;
-      console.log('[extractor]  row="' + rowText.slice(0, 20) + '" wrong-quality link discarded');
+function touchCache() {
+  try {
+    const files = fs.readdirSync(CACHE_DIR).map((n) => ({ n, s: fs.statSync(path.join(CACHE_DIR, n)) }))
+      .filter((x) => x.s.isFile());
+    const total = files.reduce((a, x) => a + x.s.size, 0);
+    if (total <= MAX_CACHE_BYTES) {
+      for (const x of files) if (Date.now() - x.s.mtimeMs > FILE_TTL_MS) fs.unlinkSync(path.join(CACHE_DIR, x.n));
+      return;
     }
-    await sleep(800);
-  }
-  return null;
+    files.sort((a, b) => a.s.mtimeMs - b.s.mtimeMs);
+    let acc = total;
+    for (const x of files) {
+      if (acc <= MAX_CACHE_BYTES) break;
+      try { fs.unlinkSync(path.join(CACHE_DIR, x.n)); acc -= x.s.size; } catch (_) {}
+    }
+  } catch (_) {}
 }
 
-async function extractFromPage(context, page, videoUrl) {
-  const t0 = Date.now();
-  let gotoErr = null;
-  try { await page.goto(SITE, { waitUntil: 'domcontentloaded', timeout: 60000 }); } catch (e) { gotoErr = e; }
-  await page.waitForTimeout(3500);
-
-  const diag = await page.evaluate(() => {
-    const b = document.body ? document.body.innerText : '';
-    return {
-      title: document.title || '',
-      url: location.href,
-      hasInput: !!document.querySelector('input#url-input-wrapper'),
-      body: b.replace(/\s+/g, ' ').slice(0, 300)
-    };
-  }).catch(() => ({}));
-  console.log('[extractor] goto=' + (gotoErr ? 'err:' + gotoErr.message.slice(0, 80) : 'ok') + ' title=' + JSON.stringify(diag.title) + ' hasInput=' + diag.hasInput + ' body=' + JSON.stringify((diag.body || '').slice(0, 140)));
-
-  const input = page.locator('input#url-input-wrapper').first();
-  try {
-    await input.waitFor({ state: 'visible', timeout: 20000 });
-    await input.click({ timeout: 10000 });
-  } catch (e) {
-    throw new Error('vidssave did not render its form for this server IP (input#url-input-wrapper missing). title="' + (diag.title || '') + '" body="' + (diag.body || '').slice(0, 160) + '"');
-  }
-  await input.type(videoUrl, { delay: 8 });
-  await page.waitForTimeout(700);
-  try {
-    await page.getByRole('button', { name: 'Download' }).first().click({ timeout: 10000 });
-  } catch (e) {
-    throw new Error('vidssave Download button did not appear. title="' + (diag.title || '') + '"');
-  }
-
-  const rows = await waitForRows(page, 4, 75000);
-  const videoRows = rows.filter((r) => !r.isAudio);
-  const audioRows = rows.filter((r) => r.isAudio);
-  console.log('[extractor] parsed rows=' + rows.length + ' video=' + videoRows.length + ' audio=' + audioRows.length + ' in ' + (Date.now() - t0) + 'ms');
-
-  const meta = await fetchOembed(videoUrl);
-  const ytId = youtubeVideoId(videoUrl);
-
-  // HD rows (>=1080P) open an upsell modal instead of a direct download and can
-  // cover the result list, so probe the reliable lower qualities from low to
-  // high, keep up to 4, then label the two best as hd/sd.
-  const videoAsc = videoRows.slice().sort((a, b) => a.qualityNum - b.qualityNum);
-
-  const variants = [];
-  const videoHits = [];
-  for (const r of videoAsc) {
-    if (videoHits.length >= 4 || (r.qualityNum === 0 && videoHits.length > 0)) break;
-    if (r.qualityNum >= 1080) continue;
-    const c = await captureRow(context, page, r.text, 9000, r.qualityNum);
-    if (c) videoHits.push({ r, c });
-  }
-  videoHits.sort((a, b) => b.r.qualityNum - a.r.qualityNum);
-  if (videoHits[0]) variants.push({ key: 'hd', ext: 'mp4', url: videoHits[0].c.url, label: videoHits[0].r.qualityNum + 'P' });
-  if (videoHits[1]) variants.push({ key: 'sd', ext: 'mp4', url: videoHits[1].c.url, label: videoHits[1].r.qualityNum + 'P' });
-
-  console.log('[extractor] variants=' + variants.map((v) => v.key).join(',') + ' total=' + (Date.now() - t0) + 'ms');
-  return {
-    title: meta.title || 'YouTube video',
-    author: meta.author || '',
-    thumbnail: ytId ? 'https://i.ytimg.com/vi/' + ytId + '/hqdefault.jpg' : '',
-    platform: 'youtube',
-    variants
-  };
-}
-
-async function doExtract(url) {
-  const browser = await getBrowser();
-  const context = await browser.newContext({
-    userAgent: UA,
-    viewport: { width: 1366, height: 1200 },
-    acceptDownloads: true
-  });
-  try {
-    const page = await context.newPage();
-    return await extractFromPage(context, page, url);
-  } finally {
-    try { await context.close(); } catch (_) {}
-  }
-}
-
+/* ---------------------------------------------------------------------------
+   Routes
+   ------------------------------------------------------------------------- */
 app.get('/', (req, res) => {
-  res.json({ ok: true, msg: 'VidSave extractor backend' });
+  res.json({ ok: true, msg: 'YouTube extractor backend (yt-dlp)' });
 });
 
-// Diagnostic: can this server reach the vidssave parse API directly?
-// (The website serves datacenter IPs an empty page; the API may not block.)
-app.get('/api/probe-innertube', async (req, res) => {
-  const videoId = req.query.id || 'dQw4w9WgXcQ';
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 20000);
+app.get('/api/extract', async (req, res) => {
+  const url = (req.query.url || '').trim();
+  const ytId = youtubeVideoId(url);
+  if (!ytId) return res.status(400).json({ error: 'Enter a valid YouTube link.' });
+
   try {
-    const r = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'user-agent': 'Mozilla/5.0' },
-      signal: ctrl.signal,
-      body: JSON.stringify({
-        context: { client: { hl: 'en', gl: 'US', clientName: 'WEB', clientVersion: '2.20240901.01.00' } },
-        videoId,
-        contentCheckOk: true,
-        racyCheckOk: true
-      })
+    const info = await loadVideoInfo(url);
+    if (info && info.is_live) return res.status(422).json({ error: 'Live streams are not supported yet.' });
+
+    const formats = (info && info.formats) || [];
+    const front = 'https://' + req.get('host');
+
+    const variants = [];
+
+    // HD: a real >=480p combined MP4 if available, otherwise lazy HD merge (720p).
+    const hd = bestCombined(formats, 720, 480);
+    if (hd) {
+      variants.push({ key: 'hd', ext: 'mp4', url: hd.url, size: hd.filesize || 0 });
+    } else {
+      variants.push({ key: 'hd', ext: 'mp4', url: front + '/api/file/' + ytId + '_hd.mp4' });
+    }
+
+    // SD: direct combined MP4 <=480p if available, otherwise lazy SD merge (480p).
+    const sd = bestCombined(formats, 480) || bestCombined(formats, 720, 360);
+    if (sd) {
+      variants.push({ key: 'sd', ext: 'mp4', url: sd.url, size: sd.filesize || 0 });
+    } else {
+      variants.push({ key: 'sd', ext: 'mp4', url: front + '/api/file/' + ytId + '_sd.mp4' });
+    }
+
+    const meta = await fetchOembed(url);
+    res.json({
+      platform: 'youtube',
+      title: (info && (info.title || '')) || meta.title || 'YouTube video',
+      author: (info && (info.channel || info.uploader || '')) || meta.author || '',
+      thumbnail: 'https://i.ytimg.com/vi/' + ytId + '/hqdefault.jpg',
+      duration: (info && info.duration) || 0,
+      variants
     });
-    clearTimeout(t);
-    const txt = await r.text();
-    let parsed = null;
-    try { parsed = JSON.parse(txt); } catch (_) {}
-    const formats = parsed && parsed.streamingData ? (parsed.streamingData.formats || []).length : 0;
-    const err = parsed && parsed.error ? parsed.error.code + '/' + parsed.error.message : null;
-    res.json({ http: r.status, ok: !!parsed && !parsed.error, formats, error: err, len: txt.length, head: txt.slice(0, 120) });
   } catch (e) {
-    clearTimeout(t);
-    res.status(500).json({ probeError: String((e && e.message) || e) });
+    console.log('[extractor] extract error: ' + ((e && e.message) || e));
+    const detail = ((e && e.stderr) || '').toString();
+    const msg = friendlyError(detail) || friendlyError((e && e.message) || '');
+    res.status(422).json({ error: msg || 'Could not resolve this video. It may be unavailable or YouTube is throttling requests. Try again in a minute.' });
+  }
+});
+
+/* Lazily produce + stream a cached merged file (HD mostly). */
+app.all('/api/file/*', async (req, res) => {
+  const name = cacheFileName(req.params[0]);
+  const ok = name;
+  if (!ok) return res.status(404).json({ error: 'unknown file' });
+
+  const { videoId, key } = (() => { const p = name.split('_'); return { videoId: p[0], key: p[1].replace('.mp4', '') }; })();
+  const maxH = key === 'hd' ? 720 : 480;
+  const full = path.join(CACHE_DIR, name);
+
+  try {
+    if (!fs.existsSync(full)) {
+      if (muxInFlight[name]) {
+        await muxInFlight[name];
+      } else {
+        const p = runMuxExclusive(() => ensureMuxed(videoId, key, maxH));
+        muxInFlight[name] = p;
+        try { await p; } finally { delete muxInFlight[name]; }
+      }
+    }
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.sendFile(full);
+  } catch (e) {
+    console.log('[extractor] mux error: ' + ((e && e.message) || e));
+    res.status(500).json({ error: 'HD merge failed: ' + (((e && e.message) || e).toString().slice(0, 140)) });
   }
 });
 
 app.get('/api/probe-ytdlp', async (req, res) => {
   const url = req.query.url || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
   const full = req.query.full === '1';
-  const check = req.query.check === '1';
   const t0 = Date.now();
   try {
-    const cmd = YTDLP + ' --no-playlist --skip-download -g -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" ' + JSON.stringify(url);
-    const out = execSync(cmd, { timeout: 70000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
-    const urls = out.trim().split(/\r?\n/).filter(Boolean);
-    const resp = { ok: urls.length > 0, count: urls.length, ms: Date.now() - t0 };
-    if (full) resp.urls = urls.slice(0, 4);
-    else resp.urls = urls.slice(0, 4).map((u) => u.slice(0, 110));
-    if (check && urls[0]) {
-      try {
-        const c = new AbortController();
-        const tt = setTimeout(() => c.abort(), 15000);
-        const hr = await fetch(urls[0], { method: 'HEAD', signal: c.signal, redirect: 'follow' });
-        clearTimeout(tt);
-        resp.head = { status: hr.status, len: hr.headers.get('content-length') || '', type: hr.headers.get('content-type') || '' };
-      } catch (e) {
-        resp.head = { error: String((e && e.message) || e) };
-      }
-    }
-    res.json(resp);
+    const args = [
+      '--no-playlist', '--no-warnings', '--no-color',
+      '--js-runtimes', JS_RUNTIME,
+      '--skip-download',
+      '-g',
+      '-f', 'best[height<=720]/best',
+      url
+    ];
+    const r = await runYt(args, 70000);
+    const urls = r.stdout.trim().split(/\r?\n/).filter(Boolean);
+    res.json({ ok: urls.length > 0, count: urls.length, ms: Date.now() - t0, urls: urls.slice(0, 4).map((u) => (full ? u : u.slice(0, 110))) });
   } catch (e) {
-    res.status(500).json({ ok: false, ms: Date.now() - t0, error: String((e && e.stderr && e.stderr.toString()) || (e && e.message) || e).slice(0, 500) });
+    res.status(500).json({ ok: false, ms: Date.now() - t0, error: String(((e && e.stderr) || '').toString() || (e && e.message) || e).slice(0, 500) });
   }
 });
 
-app.get('/api/probe', (req, res) => {
-  const link = req.query.link || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
-  const form = new URLSearchParams({
-    hostname: 'vidssave.com',
-    auth: '4c9b7d21',
-    domain: 'api-ak.vidssave.com',
-    origin: 'cache',
-    link
-  });
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 25000);
-  fetch('https://api.vidssave.com/api/contentsite_api/media/parse', {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: form.toString(),
-    redirect: 'manual',
-    signal: ctrl.signal
-  }).then(async (r) => {
-    clearTimeout(t);
-    const txt = await r.text();
-    res.json({ status: r.status, ctype: r.headers.get('content-type') || '', url: r.url, len: txt.length, head: txt.slice(0, 300) });
-  }).catch((e) => {
-    clearTimeout(t);
-    res.status(500).json({ probeError: String((e && e.message) || e) });
-  });
-});
-
-app.get('/api/extract', (req, res) => {
-  const url = req.query.url;
-  if (!url) return res.status(400).json({ error: 'url required' });
-  if (String(url).indexOf('youtube.com') === -1 && String(url).indexOf('youtu.be') === -1) {
-    return res.status(400).json({ error: 'only youtube urls supported' });
-  }
-
-  withLock(() => doExtract(url)).then((result) => {
-    if (!result.variants.length) {
-      return res.status(422).json({ error: 'vidssave did not expose any download link for this video. It may be private, removed, or blocked from this server\u2019s IP. Try again in a minute.' });
-    }
-    res.json(result);
-  }).catch((e) => {
-    console.log('[extractor] error: ' + (e && e.message));
-    res.status(500).json({ error: (e && e.message) || 'extraction failed' });
-  });
-});
-
+/* ---------------------------------------------------------------------------
+   Boot
+   ------------------------------------------------------------------------- */
 async function main() {
-  await ensureChromium();
-  await getBrowser();
   await ensureYtdlp().catch(() => {});
+  touchCache();
+  setInterval(touchCache, 30 * 60 * 1000);
   app.listen(PORT, () => {
     console.log('extractor running on ' + PORT);
   });
 }
 
-main().catch(function (e) {
-  console.error('Fatal boot error:', e.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(function (e) {
+    console.error('Fatal boot error:', e.message);
+    process.exit(1);
+  });
+} else {
+  module.exports = app;
+}
