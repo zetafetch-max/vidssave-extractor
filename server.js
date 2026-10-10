@@ -9,11 +9,28 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
 const SITE = 'https://vidssave.com/youtube-video-downloader-8hs';
+const YTDLP = './yt-dlp';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const LAUNCH_ARGS = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'];
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/* Make sure the yt-dlp binary is present (self-heal, like the browser). */
+async function ensureYtdlp() {
+  try {
+    execSync(YTDLP + ' --version', { stdio: 'ignore' });
+    return;
+  } catch (_) {}
+  try {
+    console.log('[extractor] downloading yt-dlp...');
+    execSync('curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ' + YTDLP, { stdio: 'inherit', timeout: 120000 });
+    execSync('chmod +x ' + YTDLP);
+    console.log('[extractor] yt-dlp ready');
+  } catch (e) {
+    console.log('[extractor] yt-dlp download failed: ' + (e && e.message || e));
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -309,6 +326,19 @@ app.get('/api/probe-innertube', async (req, res) => {
   }
 });
 
+app.get('/api/probe-ytdlp', async (req, res) => {
+  const url = req.query.url || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+  const t0 = Date.now();
+  try {
+    const cmd = YTDLP + ' --no-playlist --skip-download -g -f "bestvideo[height<=720]+bestaudio/best[height<=720]/best" ' + JSON.stringify(url);
+    const out = execSync(cmd, { timeout: 70000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+    const urls = out.trim().split(/\r?\n/).filter(Boolean);
+    res.json({ ok: urls.length > 0, count: urls.length, ms: Date.now() - t0, urls: urls.slice(0, 4).map((u) => u.slice(0, 110)) });
+  } catch (e) {
+    res.status(500).json({ ok: false, ms: Date.now() - t0, error: String((e && e.stderr && e.stderr.toString()) || (e && e.message) || e).slice(0, 500) });
+  }
+});
+
 app.get('/api/probe', (req, res) => {
   const link = req.query.link || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
   const form = new URLSearchParams({
@@ -357,6 +387,7 @@ app.get('/api/extract', (req, res) => {
 async function main() {
   await ensureChromium();
   await getBrowser();
+  await ensureYtdlp().catch(() => {});
   app.listen(PORT, () => {
     console.log('extractor running on ' + PORT);
   });
