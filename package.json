@@ -5,7 +5,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "postinstall": "playwright install chromium --with-deps"
   },
   "dependencies": {
     "cors": "^2.8.5",

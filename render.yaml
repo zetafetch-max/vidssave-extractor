@@ -3,7 +3,7 @@ services:
     name: vidssave-extractor
     env: node
     rootDir: backend
-    buildCommand: npm install && npx playwright install chromium
+    buildCommand: npm install && npx playwright install chromium --with-deps
     startCommand: node server.js
     envVars:
       - key: NODE_VERSION
