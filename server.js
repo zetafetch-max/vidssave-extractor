@@ -8,7 +8,13 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
+const SITE = 'https://vidssave.com/youtube-video-downloader-8hs';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+const LAUNCH_ARGS = ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'];
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 /* ---------------------------------------------------------------------------
    Chromium self-heal
@@ -18,7 +24,7 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 async function ensureChromium() {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const b = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] });
+      const b = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
       await b.close();
       console.log('[extractor] Chromium ready');
       return;
@@ -35,19 +41,32 @@ async function ensureChromium() {
   }
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+/* ---------------------------------------------------------------------------
+   Persistent browser + request serialization.
+   vidssave renders one result list at a time on a single page, so we run one
+   extraction at a time and reuse a warm browser between requests.
+   ------------------------------------------------------------------------- */
+let browserInstance = null;
+async function getBrowser() {
+  if (browserInstance) {
+    try { if (browserInstance.isConnected()) return browserInstance; } catch (_) {}
+    browserInstance = null;
+  }
+  const b = await chromium.launch({ headless: true, args: LAUNCH_ARGS });
+  b.on('disconnected', () => { if (browserInstance === b) browserInstance = null; });
+  browserInstance = b;
+  return b;
 }
 
-function withTimeout(promise, ms) {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error('timeout')), ms);
-    promise.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
-  });
+let chain = Promise.resolve();
+function withLock(fn) {
+  const result = chain.then(fn, fn);
+  chain = result.then(() => {}, () => {});
+  return result;
 }
 
 function youtubeVideoId(url) {
-  const m = String(url || '').match(/(?:youtu\.be\/|v=|shorts\/|embed\/|live\/|watch\/(?:v\/)?)([A-Za-z0-9_-]{11})/);
+  const m = String(url || '').match(/(?:youtu\.be\/|v=|\/shorts\/|\/embed\/|\/live\/|watch\/(?:v\/)?)([A-Za-z0-9_-]{11})/);
   return m ? m[1] : null;
 }
 
@@ -65,106 +84,151 @@ async function fetchOembed(url) {
   }
 }
 
-/* Collect the quality rows vidssave renders after parsing. Runs in-browser. */
+/* Collect the quality rows vidssave renders after parsing. Runs in-browser.
+   Rows are <li> cards whose text looks like "MP4 720P 28.4 MB Fast Download".
+   Nav items also say "Download" but never contain MP4/MP3, so they drop out. */
 function collectRows() {
   const rows = [];
   const lis = Array.from(document.querySelectorAll('li'));
   for (const li of lis) {
     const t = (li.textContent || '').replace(/\s+/g, ' ').trim();
     if (!/Download/i.test(t) || !/MP4|MP3/i.test(t)) continue;
-    const q = (t.match(/\b(144|240|360|480|720|1080|2160|4k|48|96|128|256)K?\s*P?\b/i) || [])[0] || '';
+    // textContent has no separators between spans, e.g. "MP4240P7.46 MBFastDownload".
+    // A lookbehind stops the greedy run from swallowing MP4/MP3's leading digit
+    // (which would turn "4720P" into 4720 and get misclassified as HD).
+    const qm = t.match(/(?<!MP)(\d+)\s*(P|KBPS)/i);
     rows.push({
-      text: t.slice(0, 42),
+      text: t,
       isAudio: /MP3/i.test(t),
-      qualityLabel: q
+      qualityNum: qm ? parseInt(qm[1], 10) || 0 : 0
     });
   }
   return rows;
 }
 
+/* Wait until the full quality list has rendered. Rows appear progressively
+   (240P/1440P land first, then the rest), so poll for a stable set. */
+async function waitForRows(page, minRows, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let rows = [];
+  let stableFor = 0;
+  while (Date.now() < deadline) {
+    rows = await page.evaluate(collectRows).catch(() => []);
+    if (rows.length >= minRows) break;
+    await sleep(2000);
+  }
+  // let any late rows paint, then take a final sample
+  await sleep(1200);
+  const final = await page.evaluate(collectRows).catch(() => rows);
+  return final.length >= rows.length ? final : rows;
+}
+
+/* Resolve with the direct link produced when a row's Download control is
+   clicked. Primary signal: the `media/download_redirect` response's Location
+   header (302 -> down-de.vidssave.com/...). Backup: a real browser download
+   event. Bound to the context so popups/secondary pages are caught too. */
+async function captureLink(context, ms) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const cleanup = () => { clearTimeout(timer); context.off('response', onResponse); context.off('download', onDownload); };
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(v && v.url && /^https?:/i.test(v.url) ? { url: v.url, name: v.name || '' } : null);
+    };
+    const onResponse = (r) => {
+      if (settled) return;
+      const u = r.url();
+      if (u.indexOf('contentsite_api/media/download_redirect') === -1) return;
+      try {
+        const loc = (r.headers()['location'] || '') || '';
+        finish(loc ? { url: loc, name: '' } : null);
+      } catch (_) {}
+    };
+    const onDownload = (d) => {
+      if (settled) return;
+      let url = '';
+      try { url = d.url(); } catch (_) {}
+      let name = '';
+      try { name = d.suggestedFilename ? d.suggestedFilename() : ''; } catch (_) {}
+      try { d.cancel && d.cancel(); } catch (_) {}
+      if (/^blob:/i.test(url)) return;
+      finish(url ? { url, name } : null);
+    };
+    context.on('response', onResponse);
+    context.on('download', onDownload);
+    const timer = setTimeout(() => finish(null), ms);
+  });
+}
+
+async function closeExtraPages(context) {
+  const pages = context.pages();
+  for (let i = 1; i < pages.length; i++) {
+    try { await pages[i].close(); } catch (_) {}
+  }
+}
+
 /* Click one quality row's Download control and capture the direct CDN URL it
-   produces (Playwright's `download` event resolves the final URL). Retries
-   once. Returns null when the row gives no usable link. */
-async function captureRow(page, rowText, waitMs) {
+   produces. Retries once. Returns null when the row gives no usable link. */
+async function captureRow(context, page, rowText, waitMs, qualityNum) {
   const locator = page.locator('li', { hasText: rowText }).locator('div[aria-disabled="false"]').first();
   for (let attempt = 0; attempt < 2; attempt++) {
-    const dlPromise = new Promise((resolve) => {
-      const handler = (d) => {
-        page.off('download', handler);
-        const url = d.url();
-        d.cancel && d.cancel().catch(() => {});
-        resolve({ url, name: d.suggestedFilename() || '' });
-      };
-      page.on('download', handler);
-    });
-    try {
-      const ok = await withTimeout(locator.click({ timeout: 15000 }).then(() => true), 16000).catch(() => false);
-      if (!ok) return null;
-    } catch (_) { /* continue */ }
-    const r = await withTimeout(dlPromise, waitMs).catch(() => null);
-    if (r && r.url && !/^blob:/.test(r.url)) return r;
+    const wait = captureLink(context, waitMs);
+    let clickOk = false;
+    try { await locator.click({ timeout: 12000 }); clickOk = true; } catch (e) { clickOk = false; }
+    const r = await wait;
+    await closeExtraPages(context);
+    console.log('[extractor]  row="' + rowText.slice(0, 20) + '" attempt=' + attempt + ' click=' + (clickOk ? 'ok' : 'fail') + ' got=' + (r && r.url ? 'link' : 'none'));
+    if (r && r.url) {
+      // Reject a stray/duplicate redirect that doesn't belong to this row's
+      // quality (vidssave re-emits recent links with a delay).
+      const matches = qualityNum === 0 || new RegExp(qualityNum + '[pP]').test(r.url);
+      if (matches) return r;
+      console.log('[extractor]  row="' + rowText.slice(0, 20) + '" wrong-quality link discarded');
+    }
+    await sleep(800);
   }
   return null;
 }
 
-async function extractFromPage(page, videoUrl) {
-  await page.goto('https://vidssave.com/youtube-video-downloader-8hs', { waitUntil: 'domcontentloaded', timeout: 90000 });
-  await page.waitForTimeout(4000);
+async function extractFromPage(context, page, videoUrl) {
+  const t0 = Date.now();
+  await page.goto(SITE, { waitUntil: 'domcontentloaded', timeout: 90000 });
+  await page.waitForTimeout(3500);
 
   const input = page.locator('input#url-input-wrapper').first();
   await input.click();
   await input.type(videoUrl, { delay: 8 });
-  await page.waitForTimeout(600);
+  await page.waitForTimeout(700);
   await page.getByRole('button', { name: 'Download' }).first().click();
 
-  await page.waitForFunction(() => {
-    const t = document.body.innerText || '';
-    return /MP4|144P|720P|1080P|MP3/.test(t);
-  }, { timeout: 70000 }).catch(() => {});
-
-  await page.waitForTimeout(1000);
-  const rows = await page.evaluate(collectRows);
+  const rows = await waitForRows(page, 4, 75000);
   const videoRows = rows.filter((r) => !r.isAudio);
   const audioRows = rows.filter((r) => r.isAudio);
-
-  const pickHigh = (list) => {
-    if (!list.length) return null;
-    const byQual = [];
-    for (const r of list) {
-      const n = parseInt(String(r.qualityLabel || '0').replace(/\D/g, ''), 10) || 0;
-      byQual.push({ row: r, n });
-    }
-    byQual.sort((a, b) => b.n - a.n);
-    return byQual[0].row;
-  };
-  const pickLow = (list, highRow) => {
-    if (list.length < 2) return null;
-    return list.find((r) => r !== highRow) || list[list.length - 1];
-  };
-
-  const hdRow = pickHigh(videoRows);
-  const sdRow = pickLow(videoRows, hdRow);
-  const audioRow = audioRows[0] || null;
+  console.log('[extractor] parsed rows=' + rows.length + ' video=' + videoRows.length + ' audio=' + audioRows.length + ' in ' + (Date.now() - t0) + 'ms');
 
   const meta = await fetchOembed(videoUrl);
   const ytId = youtubeVideoId(videoUrl);
 
-  const variants = [];
-  if (hdRow) {
-    const c = await captureRow(page, hdRow.text, 25000);
-    if (c) variants.push({ key: 'hd', ext: 'mp4', url: c.url });
-  }
-  if (sdRow) {
-    await sleep(1500);
-    const c = await captureRow(page, sdRow.text, 25000);
-    if (c) variants.push({ key: 'sd', ext: 'mp4', url: c.url });
-  }
-  if (audioRow) {
-    await sleep(1500);
-    const c = await captureRow(page, audioRow.text, 45000);
-    if (c) variants.push({ key: 'audio', ext: 'mp3', url: c.url });
-  }
+  // HD rows (>=1080P) open an upsell modal instead of a direct download and can
+  // cover the result list, so probe the reliable lower qualities from low to
+  // high, keep up to 4, then label the two best as hd/sd.
+  const videoAsc = videoRows.slice().sort((a, b) => a.qualityNum - b.qualityNum);
 
+  const variants = [];
+  const videoHits = [];
+  for (const r of videoAsc) {
+    if (videoHits.length >= 4 || (r.qualityNum === 0 && videoHits.length > 0)) break;
+    if (r.qualityNum >= 1080) continue;
+    const c = await captureRow(context, page, r.text, 9000, r.qualityNum);
+    if (c) videoHits.push({ r, c });
+  }
+  videoHits.sort((a, b) => b.r.qualityNum - a.r.qualityNum);
+  if (videoHits[0]) variants.push({ key: 'hd', ext: 'mp4', url: videoHits[0].c.url, label: videoHits[0].r.qualityNum + 'P' });
+  if (videoHits[1]) variants.push({ key: 'sd', ext: 'mp4', url: videoHits[1].c.url, label: videoHits[1].r.qualityNum + 'P' });
+
+  console.log('[extractor] variants=' + variants.map((v) => v.key).join(',') + ' total=' + (Date.now() - t0) + 'ms');
   return {
     title: meta.title || 'YouTube video',
     author: meta.author || '',
@@ -174,36 +238,46 @@ async function extractFromPage(page, videoUrl) {
   };
 }
 
+async function doExtract(url) {
+  const browser = await getBrowser();
+  const context = await browser.newContext({
+    userAgent: UA,
+    viewport: { width: 1366, height: 1200 },
+    acceptDownloads: true
+  });
+  try {
+    const page = await context.newPage();
+    return await extractFromPage(context, page, url);
+  } finally {
+    try { await context.close(); } catch (_) {}
+  }
+}
+
 app.get('/', (req, res) => {
   res.json({ ok: true, msg: 'VidSave extractor backend' });
 });
 
-app.get('/api/extract', async (req, res) => {
+app.get('/api/extract', (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'url required' });
   if (String(url).indexOf('youtube.com') === -1 && String(url).indexOf('youtu.be') === -1) {
     return res.status(400).json({ error: 'only youtube urls supported' });
   }
 
-  let browser;
-  try {
-    browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
-    const context = await browser.newContext({ userAgent: UA, viewport: { width: 1366, height: 900 }, acceptDownloads: true });
-    const page = await context.newPage();
-    const result = await extractFromPage(page, url);
+  withLock(() => doExtract(url)).then((result) => {
     if (!result.variants.length) {
       return res.status(422).json({ error: 'vidssave did not expose any download link for this video. It may be private, removed, or blocked from this server\u2019s IP. Try again in a minute.' });
     }
     res.json(result);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  } finally {
-    if (browser) await browser.close();
-  }
+  }).catch((e) => {
+    console.log('[extractor] error: ' + (e && e.message));
+    res.status(500).json({ error: (e && e.message) || 'extraction failed' });
+  });
 });
 
 async function main() {
   await ensureChromium();
+  await getBrowser();
   app.listen(PORT, () => {
     console.log('extractor running on ' + PORT);
   });
