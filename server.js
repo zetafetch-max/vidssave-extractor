@@ -280,6 +280,35 @@ app.get('/', (req, res) => {
 
 // Diagnostic: can this server reach the vidssave parse API directly?
 // (The website serves datacenter IPs an empty page; the API may not block.)
+app.get('/api/probe-innertube', async (req, res) => {
+  const videoId = req.query.id || 'dQw4w9WgXcQ';
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 20000);
+  try {
+    const r = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'user-agent': 'Mozilla/5.0' },
+      signal: ctrl.signal,
+      body: JSON.stringify({
+        context: { client: { hl: 'en', gl: 'US', clientName: 'WEB', clientVersion: '2.20240901.01.00' } },
+        videoId,
+        contentCheckOk: true,
+        racyCheckOk: true
+      })
+    });
+    clearTimeout(t);
+    const txt = await r.text();
+    let parsed = null;
+    try { parsed = JSON.parse(txt); } catch (_) {}
+    const formats = parsed && parsed.streamingData ? (parsed.streamingData.formats || []).length : 0;
+    const err = parsed && parsed.error ? parsed.error.code + '/' + parsed.error.message : null;
+    res.json({ http: r.status, ok: !!parsed && !parsed.error, formats, error: err, len: txt.length, head: txt.slice(0, 120) });
+  } catch (e) {
+    clearTimeout(t);
+    res.status(500).json({ probeError: String((e && e.message) || e) });
+  }
+});
+
 app.get('/api/probe', (req, res) => {
   const link = req.query.link || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
   const form = new URLSearchParams({
